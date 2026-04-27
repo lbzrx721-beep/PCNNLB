@@ -1,0 +1,12 @@
+logs/
+checkpoints/
+dataset/
+__pycache__/
+experiment/
+models/
+.venv/
+*.pyc
+*.pth
+*.pt
+.codex
+_downloads/
