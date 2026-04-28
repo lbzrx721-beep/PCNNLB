@@ -49,7 +49,9 @@ def parse_args():
     parser.add_argument("--dataset", default="rafdb")
     parser.add_argument("--data-root", default="dataset")
     parser.add_argument("--train-split", default="train")
-    parser.add_argument("--val-split", default="test")
+    parser.add_argument("--val-split", default="validation")
+    parser.add_argument("--test-split", default="test")
+    parser.add_argument("--test-after-training", action="store_true")
     parser.add_argument("--num-class", type=int, default=7)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=100)
@@ -92,6 +94,7 @@ def main():
 
     train_dir = os.path.join(args.data_root, args.dataset, args.train_split)
     val_dir = os.path.join(args.data_root, args.dataset, args.val_split)
+    test_dir = os.path.join(args.data_root, args.dataset, args.test_split)
 
     model = PCNN(
         num_class=args.num_class,
@@ -126,6 +129,9 @@ def main():
     write_log(log_path, f"dataset: {args.dataset}")
     write_log(log_path, f"train_split: {args.train_split}")
     write_log(log_path, f"val_split: {args.val_split}")
+    write_log(log_path, f"test_split: {args.test_split}")
+    if args.val_split == args.test_split:
+        write_log(log_path, "WARNING: val_split and test_split are identical. This is not a strict protocol.")
 
     for epoch in tqdm(range(args.epochs)):
         start_time = time.time()
@@ -146,7 +152,15 @@ def main():
         if args.skip_validation:
             val_acc, val_loss = train_acc, train_loss
         else:
-            val_acc, val_loss = validate(val_loader, model, criterion_cls, device, args, log_path)
+            val_acc, val_loss = validate(
+                val_loader,
+                model,
+                criterion_cls,
+                device,
+                args,
+                log_path,
+                phase="Validation",
+            )
 
         scheduler.step()
         recorder.update(epoch, train_loss, train_acc, val_loss, val_acc)
@@ -171,6 +185,24 @@ def main():
         write_log(log_path, f"An epoch time: {time.time() - start_time:.2f}")
 
     print(f"best_checkpoint_path: {best_checkpoint_path}")
+
+    if args.test_after_training:
+        write_log(log_path, "Loading best checkpoint for final test...")
+        checkpoint = load_checkpoint_compat(best_checkpoint_path, map_location=device)
+        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        model.load_state_dict(state_dict, strict=False)
+        test_loader = make_loader(test_dir, args.batch_size, args.workers, train=False)
+        test_acc, test_loss = validate(
+            test_loader,
+            model,
+            criterion_cls,
+            device,
+            args,
+            log_path,
+            phase="Final Test",
+        )
+        write_log(log_path, f"Final test accuracy: {test_acc:.3f}")
+        write_log(log_path, f"Final test loss: {test_loss:.4f}")
 
 
 def make_loader(path, batch_size, workers, train):
@@ -244,10 +276,10 @@ def train_one_epoch(train_loader, model, criterion_cls, optimizer, device, args,
     return top1.avg, losses.avg
 
 
-def validate(val_loader, model, criterion_cls, device, args, log_path):
+def validate(val_loader, model, criterion_cls, device, args, log_path, phase="Validation"):
     losses = AverageMeter("Loss", ":.4f")
     top1 = AverageMeter("Accuracy", ":6.3f")
-    progress = ProgressMeter(len(val_loader), [losses, top1], prefix="Test: ")
+    progress = ProgressMeter(len(val_loader), [losses, top1], prefix=f"{phase}: ")
     model.eval()
 
     with torch.no_grad():
@@ -267,7 +299,7 @@ def validate(val_loader, model, criterion_cls, device, args, log_path):
             if i % args.print_freq == 0:
                 progress.display(i, log_path)
 
-    write_log(log_path, f"Accuracy {top1.avg:.3f}")
+    write_log(log_path, f"{phase} accuracy: {top1.avg:.3f}")
     return top1.avg, losses.avg
 
 
@@ -280,7 +312,7 @@ def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):
         return targets
     dataset_name = dataset_name.lower()
 
-    if dataset_name == "rafdb" and list(classes) == ["1", "2", "3", "4", "5", "6", "7"]:
+    if "rafdb" in dataset_name and list(classes) == ["1", "2", "3", "4", "5", "6", "7"]:
         # RAF-DB basic labels:
         # 1:Surprise 2:Fear 3:Disgust 4:Happiness 5:Sadness 6:Anger 7:Neutral
         # Model order used by this checkpoint:

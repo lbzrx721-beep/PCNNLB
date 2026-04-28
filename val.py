@@ -178,7 +178,7 @@ def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):
         return targets
     dataset_name = dataset_name.lower()
 
-    if dataset_name == "rafdb" and list(classes) == ["1", "2", "3", "4", "5", "6", "7"]:
+    if "rafdb" in dataset_name and list(classes) == ["1", "2", "3", "4", "5", "6", "7"]:
         # RAF-DB basic labels:
         # 1:Surprise 2:Fear 3:Disgust 4:Happiness 5:Sadness 6:Anger 7:Neutral
         # Model order used by this checkpoint:

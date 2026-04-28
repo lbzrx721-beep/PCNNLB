@@ -43,9 +43,11 @@ def load_checkpoint_compat(path, map_location):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train PCNN for FERPlus.")
-    parser.add_argument("--data-dir", default="/media/ag/SSD/LB/MyDatasets/FERPlus_ImageFolder_majority")
+    parser.add_argument("--data-dir", default="/media/ag/SSD/LB/MyDatasets/FERPlus_ImageFolder_argmax")
     parser.add_argument("--train-split", default="train", choices=["train"])
     parser.add_argument("--val-split", default="validation", choices=["validation", "test"])
+    parser.add_argument("--test-split", default="test", choices=["test"])
+    parser.add_argument("--test-after-training", action="store_true")
     parser.add_argument("--num-class", type=int, default=8)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=100)
@@ -57,6 +59,8 @@ def parse_args():
     parser.add_argument("--lr-step", type=int, default=15)
     parser.add_argument("--alpha", type=float, default=12)
     parser.add_argument("--beta", type=float, default=8)
+    parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--stop-on-nonfinite", action="store_true", default=True)
     parser.add_argument("--print-freq", type=int, default=100)
     parser.add_argument("--backbone-path", default="models/resnet18_msceleb.pth")
     parser.add_argument("--pretrained-pcnn", default="experiment/ferplus/ferplus.pth")
@@ -82,6 +86,7 @@ def main():
 
     train_dir = os.path.join(args.data_dir, args.train_split)
     val_dir = os.path.join(args.data_dir, args.val_split)
+    test_dir = os.path.join(args.data_dir, args.test_split)
 
     model = PCNN(
         num_class=args.num_class,
@@ -114,8 +119,13 @@ def main():
     write_log(log_path, f"Training time: {now:%m-%d %H:%M}")
     write_log(log_path, f"device: {device}")
     write_log(log_path, "dataset: ferplus")
+    write_log(log_path, f"data_dir: {args.data_dir}")
     write_log(log_path, f"train_split: {args.train_split}")
     write_log(log_path, f"val_split: {args.val_split}")
+    write_log(log_path, f"test_split: {args.test_split}")
+    write_log(log_path, f"grad_clip: {args.grad_clip}")
+    if args.val_split == args.test_split:
+        write_log(log_path, "WARNING: val_split and test_split are identical. This is not a strict protocol.")
 
     for epoch in tqdm(range(args.epochs)):
         start_time = time.time()
@@ -136,7 +146,19 @@ def main():
         if args.skip_validation:
             val_acc, val_loss = train_acc, train_loss
         else:
-            val_acc, val_loss = validate(val_loader, model, criterion_cls, device, args, log_path)
+            val_acc, val_loss = validate(
+                val_loader,
+                model,
+                criterion_cls,
+                device,
+                args,
+                log_path,
+                phase="Validation",
+            )
+
+        if not np.isfinite(train_loss) or not np.isfinite(val_loss):
+            write_log(log_path, "Stopping early because a non-finite loss was detected.")
+            break
 
         scheduler.step()
         recorder.update(epoch, train_loss, train_acc, val_loss, val_acc)
@@ -161,6 +183,24 @@ def main():
         write_log(log_path, f"An epoch time: {time.time() - start_time:.2f}")
 
     print(f"best_checkpoint_path: {best_checkpoint_path}")
+
+    if args.test_after_training:
+        write_log(log_path, "Loading best checkpoint for final test...")
+        checkpoint = load_checkpoint_compat(best_checkpoint_path, map_location=device)
+        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        model.load_state_dict(state_dict, strict=False)
+        test_loader = make_loader(test_dir, args.batch_size, args.workers, train=False)
+        test_acc, test_loss = validate(
+            test_loader,
+            model,
+            criterion_cls,
+            device,
+            args,
+            log_path,
+            phase="Final Test",
+        )
+        write_log(log_path, f"Final test accuracy: {test_acc:.3f}")
+        write_log(log_path, f"Final test loss: {test_loss:.4f}")
 
 
 def make_loader(path, batch_size, workers, train):
@@ -218,12 +258,17 @@ def train_one_epoch(train_loader, model, criterion_cls, optimizer, device, args,
         optimizer.zero_grad()
         out, heads = model(images)
         loss = criterion_cls(out, targets) * args.alpha + criterion_cls(heads, targets) * args.beta
+        if args.stop_on_nonfinite and not torch.isfinite(loss):
+            write_log(log_path, f"Non-finite training loss at epoch {epoch}, batch {i}. Stop this run.")
+            return 0.0, float("nan")
         acc = accuracy(out, targets)
 
         losses.update(loss.item(), images.size(0))
         top1.update(acc.item(), images.size(0))
 
         loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
         if i % args.print_freq == 0:
@@ -232,10 +277,10 @@ def train_one_epoch(train_loader, model, criterion_cls, optimizer, device, args,
     return top1.avg, losses.avg
 
 
-def validate(val_loader, model, criterion_cls, device, args, log_path):
+def validate(val_loader, model, criterion_cls, device, args, log_path, phase="Validation"):
     losses = AverageMeter("Loss", ":.4f")
     top1 = AverageMeter("Accuracy", ":6.3f")
-    progress = ProgressMeter(len(val_loader), [losses, top1], prefix="Test: ")
+    progress = ProgressMeter(len(val_loader), [losses, top1], prefix=f"{phase}: ")
     model.eval()
 
     with torch.no_grad():
@@ -245,6 +290,9 @@ def validate(val_loader, model, criterion_cls, device, args, log_path):
             targets = remap_ferplus_targets(targets, val_loader.dataset.classes)
             out, heads = model(images)
             loss = criterion_cls(out, targets) * args.alpha + criterion_cls(heads, targets) * args.beta
+            if args.stop_on_nonfinite and not torch.isfinite(loss):
+                write_log(log_path, f"Non-finite {phase.lower()} loss at batch {i}.")
+                return 0.0, float("nan")
             acc = accuracy(out, targets)
 
             losses.update(loss.item(), images.size(0))
@@ -253,7 +301,7 @@ def validate(val_loader, model, criterion_cls, device, args, log_path):
             if i % args.print_freq == 0:
                 progress.display(i, log_path)
 
-    write_log(log_path, f"Accuracy {top1.avg:.3f}")
+    write_log(log_path, f"{phase} accuracy: {top1.avg:.3f}")
     return top1.avg, losses.avg
 
 

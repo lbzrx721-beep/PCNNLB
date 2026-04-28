@@ -16,19 +16,19 @@ EMOTIONS = [
 ]
 
 
-def majority_label(votes):
+def select_label(votes, mode):
     total = sum(votes)
     if total <= 0:
         return None
     best_idx = max(range(len(votes)), key=votes.__getitem__)
-    if votes[best_idx] <= 0.5 * total:
-        return None
     if best_idx >= len(EMOTIONS):
+        return None
+    if mode == "majority" and votes[best_idx] <= 0.5 * total:
         return None
     return EMOTIONS[best_idx]
 
 
-def convert_split(source_dir, output_dir, split_name):
+def convert_split(source_dir, output_dir, split_name, mode):
     label_path = source_dir / "label.csv"
     if not label_path.exists():
         raise FileNotFoundError(f"Missing label file: {label_path}")
@@ -45,7 +45,7 @@ def convert_split(source_dir, output_dir, split_name):
         for row in reader:
             image_name = row[0]
             votes = [float(value) for value in row[2:]]
-            label = majority_label(votes)
+            label = select_label(votes, mode)
             if label is None:
                 skipped += 1
                 continue
@@ -62,10 +62,19 @@ def convert_split(source_dir, output_dir, split_name):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert official FERPlus label.csv folders to ImageFolder majority labels."
+        description="Convert official FERPlus label.csv folders to ImageFolder hard labels."
     )
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--mode",
+        choices=["majority", "argmax"],
+        default="majority",
+        help=(
+            "majority keeps only samples with more than half of votes for one class; "
+            "argmax keeps the top-voted emotion unless it is unknown/NF."
+        ),
+    )
     args = parser.parse_args()
 
     split_map = {
@@ -75,7 +84,7 @@ def main():
     }
 
     for source_name, output_name in split_map.items():
-        counts, skipped = convert_split(args.source / source_name, args.output, output_name)
+        counts, skipped = convert_split(args.source / source_name, args.output, output_name, args.mode)
         total = sum(counts.values())
         print(f"{output_name}: kept={total} skipped={skipped}")
         for name in EMOTIONS:
