@@ -51,6 +51,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate PCNN.")
     parser.add_argument("--dataset", default="rafdb")
     parser.add_argument("--data-root", default="dataset")
+    parser.add_argument("--split", default="test")
     parser.add_argument("--num-class", type=int, default=7)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -91,7 +92,7 @@ def main():
             "Download the author's PCNN weights and place them under experiment/rafdb/."
         )
 
-    data_path = os.path.join(args.data_root, args.dataset, "test")
+    data_path = os.path.join(args.data_root, args.dataset, args.split)
     val_loader = make_loader(data_path, args.batch_size, args.workers)
     criterion_cls = nn.CrossEntropyLoss().to(device)
 
@@ -110,6 +111,7 @@ def make_loader(path, batch_size, workers):
         path,
         transforms.Compose(
             [
+                transforms.Lambda(lambda image: image.convert("RGB")),
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -129,9 +131,7 @@ def validate(val_loader, model, criterion_cls, device, args, cm_path):
     losses = AverageMeter("Loss", ":.4f")
     top1 = AverageMeter("Accuracy", ":6.3f")
     progress = ProgressMeter(len(val_loader), [losses, top1], prefix="Test: ")
-    labels_name = ["Neutral", "Happiness", "Sadness", "Surprise", "Fear", "Disgust", "Anger"]
-    if args.num_class == 8:
-        labels_name.append("Contempt")
+    labels_name = display_labels_for_dataset(args.dataset, args.num_class)
 
     model.eval()
     all_preds = []
@@ -186,7 +186,7 @@ def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):
         lut = torch.tensor([3, 4, 5, 1, 2, 6, 0], device=targets.device, dtype=torch.long)
         return lut[targets.long()]
 
-    if dataset_name == "ferplus" and list(classes) == [
+    if "ferplus" in dataset_name and list(classes) == [
         "angry",
         "contempt",
         "disgust",
@@ -201,7 +201,29 @@ def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):
         lut = torch.tensor([4, 7, 5, 6, 1, 0, 3, 2], device=targets.device, dtype=torch.long)
         return lut[targets.long()]
 
+    if "ferplus" in dataset_name and list(classes) == [
+        "anger",
+        "contempt",
+        "disgust",
+        "fear",
+        "happiness",
+        "neutral",
+        "sadness",
+        "surprise",
+    ]:
+        lut = torch.tensor([4, 7, 5, 6, 1, 0, 3, 2], device=targets.device, dtype=torch.long)
+        return lut[targets.long()]
+
     return targets
+
+
+def display_labels_for_dataset(dataset_name, num_class):
+    if "ferplus" in dataset_name.lower():
+        return ["Neutral", "Happiness", "Surprise", "Sadness", "Anger", "Disgust", "Fear", "Contempt"]
+    labels = ["Neutral", "Happiness", "Sadness", "Surprise", "Fear", "Disgust", "Anger"]
+    if num_class == 8:
+        labels.append("Contempt")
+    return labels
 
 
 class AverageMeter:

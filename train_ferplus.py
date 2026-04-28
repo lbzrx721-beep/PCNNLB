@@ -43,9 +43,9 @@ def load_checkpoint_compat(path, map_location):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train PCNN for FERPlus.")
-    parser.add_argument("--data-dir", default="/media/ag/SSD/LB/MyDatasets/DATA/FER-PLUS/archive (1)")
+    parser.add_argument("--data-dir", default="/media/ag/SSD/LB/MyDatasets/FERPlus_ImageFolder_majority")
     parser.add_argument("--train-split", default="train", choices=["train"])
-    parser.add_argument("--val-split", default="test", choices=["validation", "test"])
+    parser.add_argument("--val-split", default="validation", choices=["validation", "test"])
     parser.add_argument("--num-class", type=int, default=8)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=100)
@@ -170,6 +170,7 @@ def make_loader(path, batch_size, workers, train):
     if train:
         transform = transforms.Compose(
             [
+                transforms.Lambda(lambda image: image.convert("RGB")),
                 transforms.Resize((224, 224)),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomApply(
@@ -185,6 +186,7 @@ def make_loader(path, batch_size, workers, train):
     else:
         transform = transforms.Compose(
             [
+                transforms.Lambda(lambda image: image.convert("RGB")),
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -256,15 +258,29 @@ def validate(val_loader, model, criterion_cls, device, args, log_path):
 
 
 def remap_ferplus_targets(targets, classes):
-    expected_classes = ["angry", "contempt", "disgust", "fear", "happy", "neutral", "sad", "suprise"]
-    if list(classes) != expected_classes:
-        raise ValueError(
-            "Unexpected FERPlus class order. "
-            f"Expected {expected_classes}, but got {list(classes)}."
-        )
+    class_order = list(classes)
 
-    lut = torch.tensor([4, 7, 5, 6, 1, 0, 3, 2], device=targets.device, dtype=torch.long)
-    return lut[targets.long()]
+    if class_order == ["angry", "contempt", "disgust", "fear", "happy", "neutral", "sad", "suprise"]:
+        lut = torch.tensor([4, 7, 5, 6, 1, 0, 3, 2], device=targets.device, dtype=torch.long)
+        return lut[targets.long()]
+
+    if class_order == [
+        "anger",
+        "contempt",
+        "disgust",
+        "fear",
+        "happiness",
+        "neutral",
+        "sadness",
+        "surprise",
+    ]:
+        lut = torch.tensor([4, 7, 5, 6, 1, 0, 3, 2], device=targets.device, dtype=torch.long)
+        return lut[targets.long()]
+
+    raise ValueError(
+        "Unexpected FERPlus class order. "
+        f"Got {class_order}."
+    )
 
 
 def accuracy(logits, labels):

@@ -48,6 +48,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train PCNN for facial expression recognition.")
     parser.add_argument("--dataset", default="rafdb")
     parser.add_argument("--data-root", default="dataset")
+    parser.add_argument("--train-split", default="train")
+    parser.add_argument("--val-split", default="test")
     parser.add_argument("--num-class", type=int, default=7)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=100)
@@ -88,8 +90,8 @@ def main():
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
-    train_dir = os.path.join(args.data_root, args.dataset, "train")
-    val_dir = os.path.join(args.data_root, args.dataset, "test")
+    train_dir = os.path.join(args.data_root, args.dataset, args.train_split)
+    val_dir = os.path.join(args.data_root, args.dataset, args.val_split)
 
     model = PCNN(
         num_class=args.num_class,
@@ -122,6 +124,8 @@ def main():
     write_log(log_path, f"Training time: {now:%m-%d %H:%M}")
     write_log(log_path, f"device: {device}")
     write_log(log_path, f"dataset: {args.dataset}")
+    write_log(log_path, f"train_split: {args.train_split}")
+    write_log(log_path, f"val_split: {args.val_split}")
 
     for epoch in tqdm(range(args.epochs)):
         start_time = time.time()
@@ -176,6 +180,7 @@ def make_loader(path, batch_size, workers, train):
     if train:
         transform = transforms.Compose(
             [
+                transforms.Lambda(lambda image: image.convert("RGB")),
                 transforms.Resize((224, 224)),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomApply(
@@ -191,6 +196,7 @@ def make_loader(path, batch_size, workers, train):
     else:
         transform = transforms.Compose(
             [
+                transforms.Lambda(lambda image: image.convert("RGB")),
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -282,7 +288,7 @@ def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):
         lut = torch.tensor([3, 4, 5, 1, 2, 6, 0], device=targets.device, dtype=torch.long)
         return lut[targets.long()]
 
-    if dataset_name == "ferplus" and list(classes) == [
+    if "ferplus" in dataset_name and list(classes) == [
         "angry",
         "contempt",
         "disgust",
@@ -294,6 +300,19 @@ def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):
     ]:
         # This local FER-PLUS folder is alphabetical. The author's checkpoint
         # uses a different output order, inferred from the checkpoint outputs.
+        lut = torch.tensor([4, 7, 5, 6, 1, 0, 3, 2], device=targets.device, dtype=torch.long)
+        return lut[targets.long()]
+
+    if "ferplus" in dataset_name and list(classes) == [
+        "anger",
+        "contempt",
+        "disgust",
+        "fear",
+        "happiness",
+        "neutral",
+        "sadness",
+        "surprise",
+    ]:
         lut = torch.tensor([4, 7, 5, 6, 1, 0, 3, 2], device=targets.device, dtype=torch.long)
         return lut[targets.long()]
 
