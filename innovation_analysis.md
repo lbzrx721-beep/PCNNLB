@@ -1,5 +1,7 @@
 # PCNN 可创新点分析
 
+创建日期：2026-04-28
+
 本文档基于当前复现项目中的 PCNN 实现，对后续可行的创新优化方向进行梳理，目标是帮助在原论文《A Perception CNN for Facial Expression Recognition》的基础上开展改进实验、论文写作和消融设计。
 
 ## 1. 当前复现模型的核心特点
