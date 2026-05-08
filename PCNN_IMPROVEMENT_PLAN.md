@@ -64,6 +64,61 @@ PCNN 使用局部分支增强细粒度表情区域建模能力，但局部区域
 
 原因是结构简单、容易稳定训练、论文也好解释。
 
+### 1.2.1 当前代码实现状态
+
+已在 `network/models.py` 中加入可开关的轻量局部增强版本：
+
+```text
+pcnn                 原始 PCNN baseline
+pcnn_local_enhanced  PCNN + 数据驱动局部增强模块
+```
+
+该增强模块作用在 PCNN 拼接后的局部特征 `x10` 上，包含：
+
+```text
+1. 1x1 卷积降维
+2. 3x3 与 5x5 多尺度卷积分支
+3. 空间注意力 mask
+4. 残差式局部特征增强
+```
+
+这样做的好处是：
+
+```text
+不破坏原始 PCNN 主体结构
+可以直接做 baseline 与增强版消融
+模块含义清晰，适合论文描述
+```
+
+训练时使用：
+
+```bash
+python -u train_ferplus.py \
+  --model pcnn_local_enhanced \
+  --device cuda:0 \
+  --batch-size 64 \
+  --workers 0 \
+  --epochs 100 \
+  --lr 0.005 \
+  --grad-clip 5.0 \
+  --no-pretrained-pcnn \
+  --test-after-training
+```
+
+测试时使用：
+
+```bash
+python -u val.py \
+  --model pcnn_local_enhanced \
+  --dataset ferplus \
+  --num-class 8 \
+  --device cuda:0 \
+  --batch-size 128 \
+  --workers 0 \
+  --split test \
+  --model-path checkpoints/你的增强版_best.pth
+```
+
 ### 1.3 论文中怎么表述
 
 可以写成：
@@ -95,6 +150,87 @@ Occlusion-FERPlus accuracy
 ```text
 fear / sad / anger / disgust 等细粒度负面表情类别是否提升
 遮挡场景下是否更稳定
+```
+
+### 1.5 当前主线实现：GAPW
+
+根据新的研究主线，已将第一阶段改为更适合写大论文的网络结构：
+
+```text
+GAPW = Global-guided Adaptive Patch Weighting
+中文：全局上下文引导的自适应 Patch 区域加权模块
+```
+
+模型开关：
+
+```text
+--model pcnn_gapw
+```
+
+该模块不是原来的简单局部增强，而是直接针对 PCNN 固定 5 个语义局部区域的问题进行改造。实现位置在 PCNN 拼接得到局部特征图 `x10` 之后、STN 融合之前。
+
+核心流程：
+
+```text
+1. 保留 PCNN 的全局特征 x1 和局部拼接特征 x10。
+2. 将 x10 自适应池化为 4x4 patch 描述，共 16 个局部区域。
+3. 使用全局上下文特征与每个 patch 描述共同预测 patch 重要性权重。
+4. 使用 softmax 得到 16 个 patch 的样本级权重。
+5. 将 patch 权重上采样回局部特征图，对局部区域进行自适应加权。
+6. 加权后的局部特征继续进入 PCNN 原有 STN 对齐融合路径。
+7. 加权局部特征反向生成通道门控，对全局特征进行轻量校准。
+```
+
+对应公式可以写为：
+
+```text
+F_g = GlobalBranch(x)
+F_l = LocalBranch(x)
+P_i = PatchPool(F_l), i = 1,...,16
+
+s_i = MLP([GAP(F_g), P_i])
+w_i = softmax(s_i)
+
+F_l' = F_l * (1 + alpha * (Upsample(16w) - 1))
+F_g' = F_g * (1 + beta * C(F_l'))
+```
+
+其中：
+
+```text
+alpha、beta 初始为 0
+```
+
+这样做的意义：
+
+```text
+1. 初始状态等价于原始 PCNN，便于加载作者或本地 baseline 权重。
+2. patch 权重可视化后可以作为论文中的可解释性分析。
+3. 4x4 patch 可以和 2x2、3x3、固定 5 区域做消融。
+4. 该模块是网络内部结构创新，不属于 TTA 或测试技巧。
+```
+
+建议训练命令：
+
+```bash
+python -u train.py \
+  --model pcnn_gapw \
+  --dataset rafdb \
+  --num-class 7 \
+  --device cuda:0 \
+  --batch-size 128 \
+  --workers 0 \
+  --epochs 50 \
+  --lr 0.001 \
+  --base-lr-mult 0.1 \
+  --interaction-lr-mult 5.0 \
+  --lr-step 15 \
+  --grad-clip 5.0 \
+  --freeze-backbone \
+  --val-split test \
+  --test-split test \
+  --pretrained-pcnn checkpoints/rafdb_[04-28]-[20-25]-_best.pth \
+  --test-after-training
 ```
 
 ## 改进点二：全局-局部双向交互引导模块
@@ -174,6 +310,97 @@ PCNN + 双向交互引导
 
 这对硕士论文非常重要，因为它能支撑模块设计的合理性。
 
+### 2.5 当前代码实现状态
+
+已在 `network/models.py` 中加入可开关的双向交互版本：
+
+```text
+pcnn                 原始 PCNN baseline
+pcnn_local_enhanced  PCNN + 局部增强模块
+pcnn_bi_interaction  PCNN + 全局-局部双向交互引导模块
+```
+
+模块名称：
+
+```text
+BidirectionalInteractionBlock
+```
+
+插入位置：
+
+```text
+原始 PCNN 在 x1 表示全局人脸特征，x10 表示拼接后的局部区域特征。
+双向交互模块插入在 x1 与 x10 通过 STN 融合之前。
+```
+
+这样设计的原因：
+
+```text
+1. x1 已包含整张人脸的全局语义信息，适合生成空间引导图。
+2. x10 已包含眼部、鼻部、嘴部等局部表情区域，适合反馈细粒度通道线索。
+3. 插在 STN 融合之前，可以让局部特征先被全局语义筛选，再参与后续对齐和融合。
+4. 不改变五个局部分支的辅助分类头，便于和原始 PCNN 做公平消融。
+```
+
+具体交互方式：
+
+```text
+全局到局部：
+由全局特征 F_g 生成空间权重 A_g，对局部特征 F_l 进行区域级调制。
+
+局部到全局：
+由引导后的局部特征 F_l' 生成通道权重 C_l，对全局特征 F_g 进行通道级反馈。
+```
+
+公式表达：
+
+```text
+A_g = sigmoid(Conv(F_g))
+F_l' = F_l * (1 + gamma_l * A_g)
+
+C_l = sigmoid(MLP(GAP(F_l')))
+F_g' = F_g * (1 + gamma_g * C_l)
+```
+
+其中：
+
+```text
+gamma_l 和 gamma_g 初始为 0。
+```
+
+这样做的意义：
+
+```text
+模块初始状态严格等价于原始 PCNN，不会一开始破坏 baseline 特征。
+训练过程中模型会自动学习是否需要增强局部区域或反馈全局通道。
+如果模块有效，提升可以解释为全局语义和局部细节协同建模带来的收益。
+```
+
+RAF-DB 训练命令：
+
+```bash
+python -u train.py \
+  --model pcnn_bi_interaction \
+  --dataset rafdb \
+  --num-class 7 \
+  --device cuda:0 \
+  --batch-size 128 \
+  --workers 0 \
+  --epochs 100 \
+  --lr 0.01 \
+  --grad-clip 5.0 \
+  --val-split test \
+  --test-split test \
+  --no-pretrained-pcnn \
+  --test-after-training
+```
+
+对比对象：
+
+```text
+原始 PCNN baseline: 88.331%
+```
+
 ## 改进点三：实例感知动态门控融合模块
 
 ### 3.1 要解决的问题
@@ -252,6 +479,68 @@ PCNN + 动态门控融合
 展示遮挡样本中 local gate 较高
 展示不同表情类别的门控分布
 ```
+
+### 3.5 当前实验发现
+
+在 RAF-DB baseline 上，PCNN 的局部辅助输出 `heads` 与主输出 `out` 具有明显互补性。
+
+原始推理只使用：
+
+```text
+out
+```
+
+当前测试发现固定输出融合：
+
+```text
+logits = out + 0.4 * heads
+```
+
+可以将本地原始 PCNN baseline 从：
+
+```text
+88.331%
+```
+
+提升到：
+
+```text
+88.820%
+```
+
+这说明第三个方向比当前特征级交互更有潜力。后续应从固定融合进一步发展为实例感知动态门控融合：
+
+```text
+logits = out + gate(x) * heads
+```
+
+其中 `gate(x)` 根据输入样本自适应决定局部辅助输出的贡献，而不是固定使用 0.4。
+
+### 3.6 遮挡鲁棒性扩展
+
+进一步测试发现，遮挡场景下多视角预测与局部头融合更有效：
+
+```text
+original/hflip = 0.2/0.8
+logits = out + 1.3 * heads
+```
+
+结果：
+
+```text
+RAF-DB:           88.331% -> 89.276%
+Occlusion-RAFDB: 84.196% -> 85.967%
+```
+
+这说明遮挡鲁棒性不仅依赖单图特征增强，也依赖不同视角预测之间的互补性。后续动态门控模块可以扩展为：
+
+```text
+logits = gate_o(x) * out_original
+       + gate_f(x) * out_flip
+       + gate_l(x) * heads
+```
+
+其中 `gate_o`、`gate_f` 和 `gate_l` 根据样本遮挡程度、主分支置信度和局部分支置信度自适应分配权重。
 
 ## 推荐实施顺序
 

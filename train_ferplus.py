@@ -48,15 +48,49 @@ def parse_args():
     parser.add_argument("--val-split", default="validation", choices=["validation", "test"])
     parser.add_argument("--test-split", default="test", choices=["test"])
     parser.add_argument("--test-after-training", action="store_true")
+    parser.add_argument(
+        "--model",
+        default="pcnn",
+        choices=[
+            "pcnn",
+            "pcnn_local_enhanced",
+            "pcnn_bi_interaction",
+            "pcnn_gated_fusion",
+            "pcnn_gapw",
+        ],
+    )
     parser.add_argument("--num-class", type=int, default=8)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--lr-step", type=int, default=15)
+    parser.add_argument("--base-lr-mult", type=float, default=1.0)
+    parser.add_argument("--interaction-lr-mult", type=float, default=1.0)
+    parser.add_argument("--interaction-scale-init", type=float, default=None)
+    parser.add_argument("--gapw-scale-init", type=float, default=None)
+    parser.add_argument("--gapw-patch-grid", type=int, default=4)
+    parser.add_argument("--gapw-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Freeze ResNet feature extractors and STN localization network.",
+    )
+    parser.add_argument(
+        "--train-gapw-only",
+        action="store_true",
+        help="Freeze all existing PCNN parameters and train only GAPW.",
+    )
+    parser.add_argument(
+        "--head-fusion-weight",
+        type=float,
+        default=0.0,
+        help="Use out + weight * heads as the main prediction.",
+    )
     parser.add_argument("--alpha", type=float, default=12)
     parser.add_argument("--beta", type=float, default=8)
     parser.add_argument("--grad-clip", type=float, default=5.0)
@@ -72,6 +106,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     now = datetime.datetime.now()
     time_str = now.strftime("[%m-%d]-[%H-%M]-")
@@ -93,6 +128,12 @@ def main():
         device=device,
         backbone_path=args.backbone_path,
         require_backbone=not args.allow_random_backbone,
+        use_local_enhancement=args.model == "pcnn_local_enhanced",
+        use_bidirectional_interaction=args.model == "pcnn_bi_interaction",
+        use_gated_fusion=args.model == "pcnn_gated_fusion",
+        use_gapw=args.model == "pcnn_gapw",
+        gapw_patch_grid=args.gapw_patch_grid,
+        gapw_temperature=args.gapw_temperature,
     )
 
     if not args.no_pretrained_pcnn and os.path.exists(args.pretrained_pcnn):
@@ -100,14 +141,12 @@ def main():
         state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
         model.load_state_dict(state_dict, strict=False)
 
+    configure_interaction_module(model, args)
+    configure_gapw_module(model, args)
+    freeze_backbone_if_needed(model, args)
     model = model.to(device)
     criterion_cls = nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        args.lr,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.5)
     recorder = RecorderMeter(args.epochs)
     cudnn.benchmark = torch.cuda.is_available()
@@ -119,18 +158,28 @@ def main():
     write_log(log_path, f"Training time: {now:%m-%d %H:%M}")
     write_log(log_path, f"device: {device}")
     write_log(log_path, "dataset: ferplus")
+    write_log(log_path, f"model: {args.model}")
+    write_log(log_path, f"seed: {args.seed}")
     write_log(log_path, f"data_dir: {args.data_dir}")
     write_log(log_path, f"train_split: {args.train_split}")
     write_log(log_path, f"val_split: {args.val_split}")
     write_log(log_path, f"test_split: {args.test_split}")
     write_log(log_path, f"grad_clip: {args.grad_clip}")
+    write_log(log_path, f"base_lr_mult: {args.base_lr_mult}")
+    write_log(log_path, f"interaction_lr_mult: {args.interaction_lr_mult}")
+    write_log(log_path, f"interaction_scale_init: {args.interaction_scale_init}")
+    write_log(log_path, f"gapw_scale_init: {args.gapw_scale_init}")
+    write_log(log_path, f"gapw_patch_grid: {args.gapw_patch_grid}")
+    write_log(log_path, f"gapw_temperature: {args.gapw_temperature}")
+    write_log(log_path, f"freeze_backbone: {args.freeze_backbone}")
+    write_log(log_path, f"train_gapw_only: {args.train_gapw_only}")
+    write_log(log_path, f"head_fusion_weight: {args.head_fusion_weight}")
     if args.val_split == args.test_split:
         write_log(log_path, "WARNING: val_split and test_split are identical. This is not a strict protocol.")
 
     for epoch in tqdm(range(args.epochs)):
         start_time = time.time()
-        current_lr = optimizer.state_dict()["param_groups"][0]["lr"]
-        write_log(log_path, f"Current learning rate: {current_lr}")
+        write_log(log_path, f"Current learning rate: {format_lrs(optimizer)}")
 
         train_acc, train_loss = train_one_epoch(
             train_loader,
@@ -203,6 +252,101 @@ def main():
         write_log(log_path, f"Final test loss: {test_loss:.4f}")
 
 
+def set_seed(seed):
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+
+
+def configure_interaction_module(model, args):
+    if args.interaction_scale_init is None:
+        return
+    module = getattr(model, "bidirectional_interaction", None)
+    if module is None:
+        return
+    with torch.no_grad():
+        module.local_scale.fill_(args.interaction_scale_init)
+        module.global_scale.fill_(args.interaction_scale_init)
+
+
+def configure_gapw_module(model, args):
+    if args.gapw_scale_init is None:
+        return
+    module = getattr(model, "gapw", None)
+    if module is None:
+        return
+    with torch.no_grad():
+        module.enhance_scale.fill_(args.gapw_scale_init)
+        module.patch_scale.fill_(args.gapw_scale_init)
+        module.global_scale.fill_(args.gapw_scale_init)
+
+
+def freeze_backbone_if_needed(model, args):
+    if args.train_gapw_only:
+        for name, param in model.named_parameters():
+            param.requires_grad = name.startswith("gapw.")
+        return
+
+    if not args.freeze_backbone:
+        return
+
+    trainable_prefixes = (
+        "bidirectional_interaction.",
+        "gated_fusion.",
+        "gapw.",
+        "fc.",
+        "fc2.",
+        "fc3.",
+        "fc4.",
+        "fc6.",
+        "fc7.",
+    )
+    for name, param in model.named_parameters():
+        param.requires_grad = name.startswith(trainable_prefixes)
+
+
+def build_optimizer(model, args):
+    interaction_params = []
+    base_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith(("bidirectional_interaction.", "gated_fusion.", "gapw.")):
+            interaction_params.append(param)
+        else:
+            base_params.append(param)
+
+    param_groups = []
+    if base_params:
+        param_groups.append({"params": base_params, "lr": args.lr * args.base_lr_mult, "name": "base"})
+    if interaction_params:
+        param_groups.append(
+            {
+                "params": interaction_params,
+                "lr": args.lr * args.interaction_lr_mult,
+                "name": "interaction",
+            }
+        )
+
+    return torch.optim.SGD(
+        param_groups,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
+
+
+def format_lrs(optimizer):
+    return ", ".join(
+        f"{group.get('name', idx)}={group['lr']:.6g}"
+        for idx, group in enumerate(optimizer.param_groups)
+    )
+
+
 def make_loader(path, batch_size, workers, train):
     if not os.path.isdir(path):
         raise FileNotFoundError(f"Dataset folder not found: {path}")
@@ -234,7 +378,7 @@ def make_loader(path, batch_size, workers, train):
         )
         shuffle = False
 
-    dataset = datasets.ImageFolder(path, transform)
+    dataset = SafeImageFolder(path, transform)
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -242,6 +386,34 @@ def make_loader(path, batch_size, workers, train):
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
     )
+
+
+class SafeImageFolder(datasets.ImageFolder):
+    def __getitem__(self, index):
+        target = self.samples[index][1]
+        failures = []
+        for candidate_index in self._candidate_indices(index, target):
+            path = self.samples[candidate_index][0]
+            try:
+                if failures:
+                    tqdm.write(f"WARNING: using replacement image {path}.")
+                return super().__getitem__(candidate_index)
+            except (FileNotFoundError, OSError) as exc:
+                failures.append(f"{path}: {exc}")
+                continue
+
+        raise RuntimeError(
+            "Failed to load any image from the same class. "
+            f"First failures: {' | '.join(failures[:5])}"
+        )
+
+    def _candidate_indices(self, index, target):
+        yield index
+        total = len(self.samples)
+        for offset in range(1, total):
+            next_index = (index + offset) % total
+            if self.samples[next_index][1] == target:
+                yield next_index
 
 
 def train_one_epoch(train_loader, model, criterion_cls, optimizer, device, args, log_path, epoch):
@@ -257,11 +429,12 @@ def train_one_epoch(train_loader, model, criterion_cls, optimizer, device, args,
 
         optimizer.zero_grad()
         out, heads = model(images)
-        loss = criterion_cls(out, targets) * args.alpha + criterion_cls(heads, targets) * args.beta
+        logits = fuse_logits(out, heads, args.head_fusion_weight)
+        loss = criterion_cls(logits, targets) * args.alpha + criterion_cls(heads, targets) * args.beta
         if args.stop_on_nonfinite and not torch.isfinite(loss):
             write_log(log_path, f"Non-finite training loss at epoch {epoch}, batch {i}. Stop this run.")
             return 0.0, float("nan")
-        acc = accuracy(out, targets)
+        acc = accuracy(logits, targets)
 
         losses.update(loss.item(), images.size(0))
         top1.update(acc.item(), images.size(0))
@@ -289,11 +462,12 @@ def validate(val_loader, model, criterion_cls, device, args, log_path, phase="Va
             targets = targets.to(device)
             targets = remap_ferplus_targets(targets, val_loader.dataset.classes)
             out, heads = model(images)
-            loss = criterion_cls(out, targets) * args.alpha + criterion_cls(heads, targets) * args.beta
+            logits = fuse_logits(out, heads, args.head_fusion_weight)
+            loss = criterion_cls(logits, targets) * args.alpha + criterion_cls(heads, targets) * args.beta
             if args.stop_on_nonfinite and not torch.isfinite(loss):
                 write_log(log_path, f"Non-finite {phase.lower()} loss at batch {i}.")
                 return 0.0, float("nan")
-            acc = accuracy(out, targets)
+            acc = accuracy(logits, targets)
 
             losses.update(loss.item(), images.size(0))
             top1.update(acc.item(), images.size(0))
@@ -333,6 +507,12 @@ def remap_ferplus_targets(targets, classes):
 
 def accuracy(logits, labels):
     return (logits.argmax(dim=-1) == labels).float().mean() * 100.0
+
+
+def fuse_logits(out, heads, weight):
+    if weight == 0:
+        return out
+    return out + weight * heads
 
 
 def save_checkpoint(state, is_best, checkpoint_path, best_checkpoint_path):

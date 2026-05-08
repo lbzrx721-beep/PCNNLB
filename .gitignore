@@ -5,6 +5,7 @@ __pycache__/
 experiment/
 models/
 .venv/
+.idea/
 *.pyc
 *.pth
 *.pt

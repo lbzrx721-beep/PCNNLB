@@ -52,6 +52,17 @@ def parse_args():
     parser.add_argument("--dataset", default="rafdb")
     parser.add_argument("--data-root", default="dataset")
     parser.add_argument("--split", default="test")
+    parser.add_argument(
+        "--model",
+        default="pcnn",
+        choices=[
+            "pcnn",
+            "pcnn_local_enhanced",
+            "pcnn_bi_interaction",
+            "pcnn_gated_fusion",
+            "pcnn_gapw",
+        ],
+    )
     parser.add_argument("--num-class", type=int, default=7)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -59,6 +70,25 @@ def parse_args():
     parser.add_argument("--print-freq", type=int, default=10)
     parser.add_argument("--backbone-path", default="models/resnet18_msceleb.pth")
     parser.add_argument("--model-path", default="experiment/rafdb/rafdb.pth")
+    parser.add_argument(
+        "--head-fusion-weight",
+        type=float,
+        default=0.0,
+        help="Use out + weight * heads as the main prediction.",
+    )
+    parser.add_argument(
+        "--tta-hflip",
+        action="store_true",
+        help="Average predictions from the original and horizontally flipped image.",
+    )
+    parser.add_argument(
+        "--tta-hflip-weight",
+        type=float,
+        default=0.5,
+        help="Weight assigned to horizontally flipped predictions when --tta-hflip is enabled.",
+    )
+    parser.add_argument("--gapw-patch-grid", type=int, default=4)
+    parser.add_argument("--gapw-temperature", type=float, default=1.0)
     parser.add_argument("--allow-random-backbone", action="store_true")
     parser.add_argument(
         "--rafdb-numeric-remap",
@@ -79,6 +109,12 @@ def main():
         device=device,
         backbone_path=args.backbone_path,
         require_backbone=not args.allow_random_backbone,
+        use_local_enhancement=args.model == "pcnn_local_enhanced",
+        use_bidirectional_interaction=args.model == "pcnn_bi_interaction",
+        use_gated_fusion=args.model == "pcnn_gated_fusion",
+        use_gapw=args.model == "pcnn_gapw",
+        gapw_patch_grid=args.gapw_patch_grid,
+        gapw_temperature=args.gapw_temperature,
     ).to(device)
 
     if os.path.exists(args.model_path):
@@ -144,13 +180,14 @@ def validate(val_loader, model, criterion_cls, device, args, cm_path):
             targets = remap_targets_if_needed(
                 targets, args.dataset, val_loader.dataset.classes, args.rafdb_numeric_remap
             )
-            out, heads = model(images)
-            loss = (criterion_cls(out, targets) + criterion_cls(heads, targets)) * 10
-            acc = accuracy(out, targets)
+            out, heads = forward_with_tta(model, images, args.tta_hflip, args.tta_hflip_weight)
+            logits = fuse_logits(out, heads, args.head_fusion_weight)
+            loss = (criterion_cls(logits, targets) + criterion_cls(heads, targets)) * 10
+            acc = accuracy(logits, targets)
 
             losses.update(loss.item(), images.size(0))
             top1.update(acc.item(), images.size(0))
-            all_preds.extend(np.argmax(out.cpu().numpy(), axis=-1))
+            all_preds.extend(np.argmax(logits.cpu().numpy(), axis=-1))
             all_targets.extend(targets.cpu().numpy())
 
             if i % args.print_freq == 0:
@@ -171,6 +208,24 @@ def validate(val_loader, model, criterion_cls, device, args, cm_path):
 
 def accuracy(logits, labels):
     return (logits.argmax(dim=-1) == labels).float().mean() * 100.0
+
+
+def fuse_logits(out, heads, weight):
+    if weight == 0:
+        return out
+    return out + weight * heads
+
+
+def forward_with_tta(model, images, use_hflip, hflip_weight):
+    out, heads = model(images)
+    if not use_hflip:
+        return out, heads
+    flipped_out, flipped_heads = model(torch.flip(images, dims=[3]))
+    original_weight = 1.0 - hflip_weight
+    return (
+        original_weight * out + hflip_weight * flipped_out,
+        original_weight * heads + hflip_weight * flipped_heads,
+    )
 
 
 def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):
