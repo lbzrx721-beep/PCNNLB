@@ -85,21 +85,21 @@ image.convert("RGB")
 
 原因是官方 FERPlus 从 FER2013 生成的是 48x48 灰度 PNG，而 PCNN 的 ResNet backbone 和 ImageNet 均值方差归一化按 3 通道图像设计。显式转 RGB 可以避免灰度图通道数不匹配或底层张量异常。
 
-## 4. train_ferplus.py 的改动
+## 4. 统一训练入口
 
-`train_ferplus.py` 默认数据目录改为：
+RAF-DB 与 FERPlus 现在统一使用 `train.py`。通过数据集参数启用 FERPlus 默认配置：
 
-```text
-/media/ag/SSD/LB/MyDatasets/FERPlus_ImageFolder_majority
+```bash
+python train.py --dataset ferplus
 ```
 
-默认验证集改为：
+统一入口会自动使用 8 个类别和 `experiment/ferplus/ferplus.pth`，也可以通过 `--data-dir` 直接指定包含 `train/validation/test` 的目录。默认验证集仍为：
 
 ```text
 validation
 ```
 
-同时支持两套 FERPlus 类别命名：
+标签映射同时支持两套 FERPlus 类别命名：
 
 ```text
 旧整理版：angry, happy, sad, suprise
@@ -153,7 +153,8 @@ test       -> Occlusion-FERPlus/images_by_label
 cd /home/ag/LB/PCNN
 conda activate LB
 
-python -u train_ferplus.py \
+python -u train.py \
+  --dataset ferplus \
   --device cuda:0 \
   --batch-size 64 \
   --workers 0 \
@@ -164,7 +165,8 @@ python -u train_ferplus.py \
 如果运行稳定，可以提高数据加载速度：
 
 ```bash
-python -u train_ferplus.py \
+python -u train.py \
+  --dataset ferplus \
   --device cuda:0 \
   --batch-size 64 \
   --workers 4 \

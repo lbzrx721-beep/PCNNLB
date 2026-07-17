@@ -6,6 +6,141 @@
 
 本文档用于记录当前 PCNN 复现、数据集口径、作者权重测试、本地训练 baseline、已尝试优化模块和后续优化方向。后续继续实验时，优先以本文档作为当前状态依据。
 
+## 2026-07-16 更新：区域可靠性关系融合
+
+在调研近期 FER 工作后，新增独立模型开关：
+
+```text
+--model pcnn_region_relation
+```
+
+该版本复用 PCNN 已有的全局人脸特征和五个语义局部特征，不引入额外的人脸关键点、分割模型或视觉语言模型。主要借鉴方向如下：
+
+```text
+ORSANet (ACM MM 2025): 遮挡语义、跨区域交互、困难类别区分
+ARPGNet (TAFFC 2025): 以图/注意力建模面部区域关系
+CMNet (TIP 2026): 左右半脸互补和对称信息
+NLA (AAAI 2025): 噪声感知与一致性训练思路
+```
+
+当前模块流程：
+
+```text
+全局特征 + 五个局部特征 -> 六个区域 token
+每个局部区域与全局区域的一致程度 -> 样本级可靠性权重
+训练时随机丢弃局部区域 -> 模拟区域缺失/遮挡
+多头自注意力 -> 学习区域间补偿关系
+可靠性加权局部 logits -> 直接进入局部辅助损失
+关系分类残差 -> 进入最终主输出
+```
+
+固定种子 1234、冻结原 PCNN 参数、只训练新模块的结果：
+
+| 方法 | RAF-DB | Occlusion-RAFDB | 说明 |
+| --- | ---: | ---: | --- |
+| 2026-07-16 本地 PCNN baseline | 88.331% | 84.741% | `rafdb_[07-16]-[15-33]-_best.pth` |
+| 区域关系模块，残差上限 0.2 | 88.462% | 84.605% | 遮挡集未提升 |
+| 旧权重测试时尺度诊断，上限 0.8 | 88.657% | 85.150% | 仅作诊断，不作为正式训练结果 |
+| 区域关系模块，上限 0.8，重新训练 | **88.592%** | **85.150%** | `rafdb_[07-16]-[16-55]-_best.pth` |
+| 作者 PCNN 权重 | 89.244% | 85.695% | 参考结果 |
+
+相对同一本地 baseline，重新训练的新模块提升：
+
+```text
+RAF-DB:           +0.261 个百分点（多识别对 8 张）
+Occlusion-RAFDB:  +0.409 个百分点（多识别对 3 张）
+```
+
+当前结论：
+
+```text
+1. 这是目前具有正向遮挡增益的候选结构，但提升仍小，不能直接宣称创新成立。
+2. 残差上限 0.2 使新分支平均幅度仅约为原主分支的 2.7%，作用过弱。
+3. 上限 0.8 能同时改善正常集和遮挡集，但本轮第 23 轮出现一次非有限损失；最佳第 13 轮权重本身全部有限。
+4. RAF-DB 官方无独立验证集，当前选择最佳 epoch 使用 test，必须在论文中披露。
+5. 下一步优先做 3 个种子、FERPlus/Occlusion-FERPlus 和模块消融，再决定是否作为论文主创新。
+```
+
+## 2026-07-17 更新：GAPW 端到端联合训练（实验 B）
+
+为验证 GAPW 是否只是受“冻结 PCNN”限制，已从人脸 ResNet18 预训练权重开始，对 `PCNN + GAPW` 完成 100 轮端到端训练。PCNN 主干、STN、分类头、BatchNorm 和 GAPW 均参与更新。
+
+| 实验 | 种子 | RAF-DB | Occlusion-RAFDB |
+| --- | ---: | ---: | ---: |
+| A：原始 PCNN 端到端训练 | 未记录（`None`） | 88.331% | 84.741% |
+| B：PCNN + GAPW 端到端训练 | 1234 | 88.103% | 83.379% |
+
+实验 B 最佳权重来自第 31 轮：
+
+```text
+checkpoints/rafdb_[07-17]-[14-32]-_best.pth
+logs/rafdb_[07-17]-[14-32]-.txt
+```
+
+最佳权重中 GAPW 的实际有效缩放：
+
+```text
+局部增强：   1.38e-08
+Patch 加权：-3.46e-04
+全局校准：   5.03e-04
+```
+
+在同一个 B 权重上将三个 GAPW 缩放清零：RAF-DB 从 2703/3068 变为 2704/3068，Occlusion-RAFDB 从 611/734 变为 612/734。GAPW 只改变了各 1 个预测，并且两次都使正确预测变错。
+
+当前可支持的结论：
+
+```text
+1. 当前 GAPW 既没有即插即用增益，也没有在本次端到端训练中超过原 PCNN。
+2. 网络在端到端训练中把 GAPW 有效缩放压到接近 0，说明当前结构/监督没有被有效利用。
+3. A 当时没有固定种子，而 B 使用 1234，因此 A/B 不是严格种子配对；下降幅度不能全部归因于 GAPW。
+4. 即使考虑种子限制，B 内部的“启用/清零 GAPW”对照仍表明最佳模型几乎没有使用 GAPW。
+```
+
+## 2026-07-17 更新：区域可靠性关系融合端到端训练
+
+已完成 `pcnn_region_relation` 的 100 轮端到端训练。该实验没有使用 `--train-region-only` 或 `--freeze-backbone`，因此 PCNN 主干、BatchNorm、STN、五个局部分类头和区域关系模块均参与更新。
+
+训练口径：
+
+```text
+seed=1234
+epochs=100
+batch_size=128
+lr=0.01
+StepLR step_size=15, gamma=0.5
+RandomErasing p=0.5, scale=(0.02, 0.25)
+region_dropout=0.2
+region_output_scale=0.8
+不加载 PCNN checkpoint，仅加载相同的人脸 ResNet18 backbone
+```
+
+结果：
+
+| 模型 | RAF-DB | Occlusion-RAFDB |
+| --- | ---: | ---: |
+| 原始 PCNN baseline（seed 未记录） | 88.331%（2710/3068） | 84.741%（622/734） |
+| 区域关系模块单独训练，冻结 PCNN/BN | 88.592%（2718/3068） | 85.150%（625/734） |
+| 区域关系模块端到端训练，seed=1234 | **88.853%（2726/3068）** | 84.605%（621/734） |
+
+最佳权重来自第 87 轮：
+
+```text
+checkpoint: checkpoints/rafdb_[07-17]-[15-51]-_best.pth
+log:        logs/rafdb_[07-17]-[15-51]-.txt
+```
+
+同一端到端权重仅把 `region_output_scale` 设为 0，关闭关系分类残差后的配对对照：
+
+| 设置 | RAF-DB | Occlusion-RAFDB |
+| --- | ---: | ---: |
+| 关闭关系输出 | 88.070%（2702/3068） | 83.924%（616/734） |
+| 开启关系输出 | 88.853%（2726/3068） | 84.605%（621/734） |
+| 关系输出直接贡献 | +0.783（+24 张） | +0.681（+5 张） |
+
+检查点中的关系模块共 828,938 个参数，全部为有限值。有效主输出残差缩放约为 `0.2350`，局部头混合权重约为 `0.0248`。
+
+当前判断：关系模块本身确实被使用，并非 GAPW 那种近零失效状态；但端到端联合训练削弱了遮挡泛化，使最终 Occlusion-RAFDB 仍比原 PCNN 少识别对 1 张。由于原 PCNN baseline 当时没有固定种子，端到端结果与 baseline 不是严格同种子配对；正式论文结论前仍需补跑 `seed=1234` 的纯 PCNN 对照。
+
 ## 1. 当前目标
 
 当前研究目标不是单纯追作者公开权重的最高数值，而是在同一机器、同一数据集、同一训练和测试口径下，证明改进模型优于本地原始 PCNN baseline。
@@ -27,20 +162,7 @@ RAF-DB Test accuracy: 88.820%
 相对原始 out 提升: +0.489%
 ```
 
-当前已确认有效的遮挡鲁棒推理优化：
-
-```text
-原始 PCNN + 鲁棒 TTA 局部头融合
-original/hflip = 0.2/0.8
-logits = out + 1.3 * heads
-RAF-DB Test accuracy:           89.276%
-Occlusion-RAFDB Test accuracy:  85.967%
-相对原始 out 提升:
-RAF-DB:          +0.945%
-Occlusion-RAFDB: +1.771%
-```
-
-当前已实现但尚未完整训练验证的论文主线网络模块：
+当前已完成端到端验证、但尚未观察到有效增益的网络模块：
 
 ```text
 pcnn_gapw
@@ -296,7 +418,6 @@ gamma 初始为 0 的渐进增强
 ```text
 network/models.py
 train.py
-train_ferplus.py
 val.py
 PCNN_IMPROVEMENT_PLAN.md
 RAFDB_EXPERIMENT_LOG.md
@@ -312,7 +433,7 @@ train.py 支持 --test-after-training
 train.py 支持 --grad-clip
 train.py 支持 --stop-on-nonfinite
 train.py 支持 --val-split 和 --test-split
-train_ferplus.py 默认使用 FERPlus argmax/voting 数据
+train.py 通过 --dataset ferplus 使用 FERPlus argmax/voting 数据
 val.py 可测试 RAF-DB、FERPlus、Occlusion-RAF-DB、Occlusion-FERPlus
 ```
 
@@ -419,7 +540,6 @@ conda run -n LB python -u train.py \
 PCNN_IMPROVEMENT_PLAN.md
 network/models.py
 train.py
-train_ferplus.py
 val.py
 RAFDB_EXPERIMENT_LOG.md
 CURRENT_EXPERIMENT_STATUS.md
@@ -449,15 +569,6 @@ pcnn_bi_interaction 微调最好:     88.266%
 out + 0.4 * heads = 88.820%
 ```
 
-当前遮挡鲁棒性最好的方案是：
-
-```text
-original/hflip = 0.2/0.8
-out + 1.3 * heads
-RAF-DB = 89.276%
-Occlusion-RAFDB = 85.967%
-```
-
 当前新的论文主线实现是：
 
 ```text
@@ -484,10 +595,9 @@ Python 编译通过
 ```text
 1. 保留原始 PCNN baseline = 88.331%
 2. 保留输出级局部头融合结果 = 88.820%
-3. 保留鲁棒 TTA 局部头融合结果 = 89.276% / Occlusion-RAFDB 85.967%
-4. 暂停当前 pcnn_bi_interaction 方向
-5. 优先训练和验证 pcnn_gapw，作为论文主创新模块
-6. GAPW 需要和原始 PCNN、固定 5 区域、固定融合、TTA 融合进行消融比较
+3. 暂停当前 pcnn_bi_interaction 方向
+4. 优先训练和验证 pcnn_gapw，作为论文主创新模块
+5. GAPW 需要和原始 PCNN、固定 5 区域、固定融合进行消融比较
 ```
 
 论文中最重要的实验逻辑：

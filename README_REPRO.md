@@ -67,10 +67,18 @@ conda activate LB
 
 ## 四、训练命令
 
+RAF-DB 与 FERPlus 共用 `train.py`。
+
 RAF-DB 上的基础训练命令：
 
 ```bash
 python train.py --device cuda:0 --dataset rafdb
+```
+
+FERPlus 上的基础训练命令（自动使用 8 类和 FERPlus 作者权重）：
+
+```bash
+python train.py --device cuda:0 --dataset ferplus
 ```
 
 如果只想在 CPU 上快速检查代码是否能跑通，可以使用：
@@ -81,10 +89,18 @@ python train.py --device cpu --dataset rafdb --epochs 1 --batch-size 2 --workers
 
 ## 五、测试命令
 
+所有数据集共用 `val.py`。
+
 RAF-DB 上的基础测试命令：
 
 ```bash
 python val.py --device cuda:0 --dataset rafdb
+```
+
+FERPlus 上的基础测试命令：
+
+```bash
+python val.py --device cuda:0 --dataset ferplus
 ```
 
 如果只想在 CPU 上快速检查测试流程，可以使用：

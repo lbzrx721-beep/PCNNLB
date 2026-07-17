@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import os
+import random
 import shutil
 import sys
 import time
@@ -44,10 +45,18 @@ def load_checkpoint_compat(path, map_location):
     return torch.load(path, map_location=map_location, weights_only=False)
 
 
-def parse_args():
+def parse_args(default_dataset="rafdb"):
     parser = argparse.ArgumentParser(description="Train PCNN for facial expression recognition.")
-    parser.add_argument("--dataset", default="rafdb")
+    parser.add_argument("--dataset", default=default_dataset)
     parser.add_argument("--data-root", default="dataset")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help=(
+            "Direct dataset directory containing train/validation/test. "
+            "When set, it takes precedence over --data-root/--dataset."
+        ),
+    )
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--val-split", default="validation")
     parser.add_argument("--test-split", default="test")
@@ -61,14 +70,25 @@ def parse_args():
             "pcnn_bi_interaction",
             "pcnn_gated_fusion",
             "pcnn_gapw",
+            "pcnn_region_relation",
         ],
     )
-    parser.add_argument("--num-class", type=int, default=7)
+    parser.add_argument(
+        "--num-class",
+        type=int,
+        default=None,
+        help="Defaults to 8 for FERPlus datasets and 7 otherwise.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="Random seed used for model initialization, data shuffling, and augmentation.",
+    )
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -79,6 +99,19 @@ def parse_args():
     parser.add_argument("--gapw-scale-init", type=float, default=None)
     parser.add_argument("--gapw-patch-grid", type=int, default=4)
     parser.add_argument("--gapw-temperature", type=float, default=1.0)
+    parser.add_argument("--gapw-overlap-ratio", type=float, default=0.0)
+    parser.add_argument("--gapw-adaptive-crop", action="store_true")
+    parser.add_argument("--gapw-max-offset", type=float, default=0.25)
+    parser.add_argument("--gapw-attention-pool", action="store_true")
+    parser.add_argument("--region-relation-heads", type=int, default=4)
+    parser.add_argument("--region-dropout", type=float, default=0.2)
+    parser.add_argument("--region-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--region-output-scale",
+        type=float,
+        default=0.8,
+        help="Maximum residual scale of the region-relation classifier.",
+    )
     parser.add_argument(
         "--freeze-backbone",
         action="store_true",
@@ -90,15 +123,15 @@ def parse_args():
         help="Freeze all existing PCNN parameters and train only GAPW.",
     )
     parser.add_argument(
+        "--train-region-only",
+        action="store_true",
+        help="Freeze the original PCNN and train only region-relation fusion.",
+    )
+    parser.add_argument(
         "--head-fusion-weight",
         type=float,
         default=0.0,
         help="Use out + weight * heads as the main prediction.",
-    )
-    parser.add_argument(
-        "--tta-hflip",
-        action="store_true",
-        help="Use horizontal-flip TTA during validation and final test.",
     )
     parser.add_argument("--erasing-p", type=float, default=0.5)
     parser.add_argument("--erasing-scale-min", type=float, default=0.02)
@@ -109,8 +142,17 @@ def parse_args():
     parser.add_argument("--stop-on-nonfinite", action="store_true", default=True)
     parser.add_argument("--print-freq", type=int, default=100)
     parser.add_argument("--backbone-path", default="models/resnet18_msceleb.pth")
-    parser.add_argument("--pretrained-pcnn", default="experiment/rafdb/rafdb.pth")
+    parser.add_argument(
+        "--pretrained-pcnn",
+        default=None,
+        help="Defaults to the matching RAF-DB or FERPlus author checkpoint.",
+    )
     parser.add_argument("--no-pretrained-pcnn", action="store_true")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Resume model, optimizer, epoch, and LR schedule from a training checkpoint.",
+    )
     parser.add_argument("--allow-random-backbone", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument(
@@ -119,11 +161,22 @@ def parse_args():
         default=True,
         help="Remap numeric RAF-DB folders (1..7) to model label order.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    return apply_dataset_defaults(args)
 
 
-def main():
-    args = parse_args()
+def apply_dataset_defaults(args):
+    is_ferplus = "ferplus" in args.dataset.lower()
+    if args.num_class is None:
+        args.num_class = 8 if is_ferplus else 7
+    if args.pretrained_pcnn is None:
+        checkpoint_dataset = "ferplus" if is_ferplus else "rafdb"
+        args.pretrained_pcnn = f"experiment/{checkpoint_dataset}/{checkpoint_dataset}.pth"
+    return args
+
+
+def main(default_dataset="rafdb"):
+    args = parse_args(default_dataset=default_dataset)
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     now = datetime.datetime.now()
@@ -137,9 +190,10 @@ def main():
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
-    train_dir = os.path.join(args.data_root, args.dataset, args.train_split)
-    val_dir = os.path.join(args.data_root, args.dataset, args.val_split)
-    test_dir = os.path.join(args.data_root, args.dataset, args.test_split)
+    dataset_dir = args.data_dir or os.path.join(args.data_root, args.dataset)
+    train_dir = os.path.join(dataset_dir, args.train_split)
+    val_dir = os.path.join(dataset_dir, args.val_split)
+    test_dir = os.path.join(dataset_dir, args.test_split)
 
     model = PCNN(
         num_class=args.num_class,
@@ -150,11 +204,32 @@ def main():
         use_bidirectional_interaction=args.model == "pcnn_bi_interaction",
         use_gated_fusion=args.model == "pcnn_gated_fusion",
         use_gapw=args.model == "pcnn_gapw",
+        use_region_relation=args.model == "pcnn_region_relation",
         gapw_patch_grid=args.gapw_patch_grid,
         gapw_temperature=args.gapw_temperature,
+        gapw_overlap_ratio=args.gapw_overlap_ratio,
+        gapw_adaptive_crop=args.gapw_adaptive_crop,
+        gapw_max_offset=args.gapw_max_offset,
+        gapw_attention_pool=args.gapw_attention_pool,
+        region_relation_heads=args.region_relation_heads,
+        region_dropout=args.region_dropout,
+        region_temperature=args.region_temperature,
+        region_output_scale=args.region_output_scale,
     )
 
-    if not args.no_pretrained_pcnn and os.path.exists(args.pretrained_pcnn):
+    resume_checkpoint = None
+    if args.resume:
+        if not os.path.isfile(args.resume):
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+        resume_checkpoint = load_checkpoint_compat(args.resume, map_location=device)
+        state_dict = (
+            resume_checkpoint["state_dict"]
+            if "state_dict" in resume_checkpoint
+            else resume_checkpoint
+        )
+        # Exact resume requires the same architecture as the saved run.
+        model.load_state_dict(state_dict, strict=True)
+    elif not args.no_pretrained_pcnn and os.path.exists(args.pretrained_pcnn):
         checkpoint = load_checkpoint_compat(args.pretrained_pcnn, map_location=device)
         state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
         model.load_state_dict(state_dict, strict=False)
@@ -167,15 +242,45 @@ def main():
     optimizer = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.5)
     recorder = RecorderMeter(args.epochs)
-    cudnn.benchmark = torch.cuda.is_available()
+    start_epoch = 0
+    best_acc = 0.0
+    best_model_path = best_checkpoint_path
+    if resume_checkpoint is not None:
+        if "optimizer" not in resume_checkpoint:
+            raise KeyError("Resume checkpoint does not contain optimizer state.")
+        optimizer.load_state_dict(resume_checkpoint["optimizer"])
+        start_epoch = int(resume_checkpoint.get("epoch", 0))
+        best_acc = float(resume_checkpoint.get("best_acc", 0.0))
+        if start_epoch >= args.epochs:
+            raise ValueError(
+                f"Checkpoint is already at epoch {start_epoch}, but --epochs is {args.epochs}. "
+                "Set --epochs to the desired total epoch count."
+            )
+
+        if "scheduler" in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint["scheduler"])
+        else:
+            # Legacy checkpoints saved the optimizer after scheduler.step().
+            # Its current LR is already correct; restoring last_epoch preserves
+            # the original StepLR boundaries (75 and 90 for this RAF-DB run).
+            scheduler.last_epoch = start_epoch
+            scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
+
+        restore_recorder(recorder, resume_checkpoint.get("recorder"))
+        previous_best_path = args.resume[:-4] + "_best.pth" if args.resume.endswith(".pth") else ""
+        best_model_path = previous_best_path if os.path.isfile(previous_best_path) else args.resume
+    # Keep deterministic cuDNN behavior whenever a seed is configured.
+    # benchmark=True may select different convolution algorithms between runs.
+    cudnn.deterministic = args.seed is not None
+    cudnn.benchmark = torch.cuda.is_available() and args.seed is None
 
     train_loader = make_loader(train_dir, args.batch_size, args.workers, train=True, args=args)
     val_loader = make_loader(val_dir, args.batch_size, args.workers, train=False, args=args)
 
-    best_acc = 0.0
     write_log(log_path, f"Training time: {now:%m-%d %H:%M}")
     write_log(log_path, f"device: {device}")
     write_log(log_path, f"dataset: {args.dataset}")
+    write_log(log_path, f"data_dir: {dataset_dir}")
     write_log(log_path, f"model: {args.model}")
     write_log(log_path, f"seed: {args.seed}")
     write_log(log_path, f"train_split: {args.train_split}")
@@ -188,16 +293,27 @@ def main():
     write_log(log_path, f"gapw_scale_init: {args.gapw_scale_init}")
     write_log(log_path, f"gapw_patch_grid: {args.gapw_patch_grid}")
     write_log(log_path, f"gapw_temperature: {args.gapw_temperature}")
+    write_log(log_path, f"gapw_overlap_ratio: {args.gapw_overlap_ratio}")
+    write_log(log_path, f"gapw_adaptive_crop: {args.gapw_adaptive_crop}")
+    write_log(log_path, f"gapw_max_offset: {args.gapw_max_offset}")
+    write_log(log_path, f"gapw_attention_pool: {args.gapw_attention_pool}")
+    write_log(log_path, f"region_relation_heads: {args.region_relation_heads}")
+    write_log(log_path, f"region_output_scale: {args.region_output_scale}")
+    write_log(log_path, f"region_dropout: {args.region_dropout}")
+    write_log(log_path, f"region_temperature: {args.region_temperature}")
     write_log(log_path, f"freeze_backbone: {args.freeze_backbone}")
     write_log(log_path, f"train_gapw_only: {args.train_gapw_only}")
+    write_log(log_path, f"train_region_only: {args.train_region_only}")
     write_log(log_path, f"head_fusion_weight: {args.head_fusion_weight}")
-    write_log(log_path, f"tta_hflip: {args.tta_hflip}")
     write_log(log_path, f"erasing_p: {args.erasing_p}")
     write_log(log_path, f"erasing_scale: ({args.erasing_scale_min}, {args.erasing_scale_max})")
+    write_log(log_path, f"resume: {args.resume}")
+    write_log(log_path, f"start_epoch: {start_epoch}")
+    write_log(log_path, f"restored_best_acc: {best_acc:.3f}")
     if args.val_split == args.test_split:
         write_log(log_path, "WARNING: val_split and test_split are identical. This is not a strict protocol.")
 
-    for epoch in tqdm(range(args.epochs)):
+    for epoch in tqdm(range(start_epoch, args.epochs), initial=start_epoch, total=args.epochs):
         start_time = time.time()
         write_log(log_path, f"Current learning rate: {format_lrs(optimizer)}")
 
@@ -241,21 +357,24 @@ def main():
                 "state_dict": model.state_dict(),
                 "best_acc": best_acc,
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "recorder": recorder,
             },
             is_best,
             checkpoint_path,
             best_checkpoint_path,
         )
+        if is_best:
+            best_model_path = best_checkpoint_path
 
         write_log(log_path, f"Current best accuracy: {best_acc:.3f}")
         write_log(log_path, f"An epoch time: {time.time() - start_time:.2f}")
 
-    print(f"best_checkpoint_path: {best_checkpoint_path}")
+    print(f"best_checkpoint_path: {best_model_path}")
 
     if args.test_after_training:
         write_log(log_path, "Loading best checkpoint for final test...")
-        checkpoint = load_checkpoint_compat(best_checkpoint_path, map_location=device)
+        checkpoint = load_checkpoint_compat(best_model_path, map_location=device)
         state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
         model.load_state_dict(state_dict, strict=False)
         test_loader = make_loader(test_dir, args.batch_size, args.workers, train=False, args=args)
@@ -275,6 +394,7 @@ def main():
 def set_seed(seed):
     if seed is None:
         return
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
@@ -312,6 +432,11 @@ def freeze_backbone_if_needed(model, args):
             param.requires_grad = name.startswith("gapw.")
         return
 
+    if args.train_region_only:
+        for name, param in model.named_parameters():
+            param.requires_grad = name.startswith("region_relation.")
+        return
+
     if not args.freeze_backbone:
         return
 
@@ -336,7 +461,9 @@ def build_optimizer(model, args):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.startswith(("bidirectional_interaction.", "gated_fusion.", "gapw.")):
+        if name.startswith(
+            ("bidirectional_interaction.", "gated_fusion.", "gapw.", "region_relation.")
+        ):
             interaction_params.append(param)
         else:
             base_params.append(param)
@@ -364,6 +491,24 @@ def format_lrs(optimizer):
     return ", ".join(
         f"{group.get('name', idx)}={group['lr']:.6g}"
         for idx, group in enumerate(optimizer.param_groups)
+    )
+
+
+def restore_recorder(recorder, saved_recorder):
+    """Copy compatible history into a recorder sized for the requested run."""
+    if saved_recorder is None:
+        return
+
+    saved_losses = getattr(saved_recorder, "epoch_losses", None)
+    saved_accuracy = getattr(saved_recorder, "epoch_accuracy", None)
+    if saved_losses is not None:
+        rows = min(recorder.epoch_losses.shape[0], saved_losses.shape[0])
+        recorder.epoch_losses[:rows] = saved_losses[:rows]
+    if saved_accuracy is not None:
+        rows = min(recorder.epoch_accuracy.shape[0], saved_accuracy.shape[0])
+        recorder.epoch_accuracy[:rows] = saved_accuracy[:rows]
+    recorder.current_epoch = min(
+        int(getattr(saved_recorder, "current_epoch", 0)), recorder.total_epoch
     )
 
 
@@ -447,6 +592,14 @@ def train_one_epoch(train_loader, model, criterion_cls, optimizer, device, args,
     top1 = AverageMeter("Accuracy", ":6.3f")
     progress = ProgressMeter(len(train_loader), [losses, top1], prefix=f"Epoch: [{epoch}]")
     model.train()
+    if args.train_gapw_only or args.train_region_only:
+        # Frozen PCNN BatchNorm buffers must remain unchanged; otherwise this
+        # is not a module-only ablation even though parameters require no grad.
+        model.eval()
+        if args.train_gapw_only:
+            model.gapw.train()
+        else:
+            model.region_relation.train()
 
     for i, (images, targets) in enumerate(train_loader):
         images = images.to(device)
@@ -491,7 +644,7 @@ def validate(val_loader, model, criterion_cls, device, args, log_path, phase="Va
             targets = remap_targets_if_needed(
                 targets, args.dataset, val_loader.dataset.classes, args.rafdb_numeric_remap
             )
-            out, heads = forward_with_tta(model, images, args.tta_hflip)
+            out, heads = model(images)
             logits = fuse_logits(out, heads, args.head_fusion_weight)
             loss = criterion_cls(logits, targets) * args.alpha + criterion_cls(heads, targets) * args.beta
             if args.stop_on_nonfinite and not torch.isfinite(loss):
@@ -517,14 +670,6 @@ def fuse_logits(out, heads, weight):
     if weight == 0:
         return out
     return out + weight * heads
-
-
-def forward_with_tta(model, images, use_hflip):
-    out, heads = model(images)
-    if not use_hflip:
-        return out, heads
-    flipped_out, flipped_heads = model(torch.flip(images, dims=[3]))
-    return (out + flipped_out) / 2, (heads + flipped_heads) / 2
 
 
 def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):

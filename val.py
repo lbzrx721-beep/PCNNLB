@@ -47,10 +47,18 @@ def load_checkpoint_compat(path, map_location):
     return torch.load(path, map_location=map_location, weights_only=False)
 
 
-def parse_args():
+def parse_args(default_dataset="rafdb"):
     parser = argparse.ArgumentParser(description="Evaluate PCNN.")
-    parser.add_argument("--dataset", default="rafdb")
+    parser.add_argument("--dataset", default=default_dataset)
     parser.add_argument("--data-root", default="dataset")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help=(
+            "Direct dataset directory containing the requested split. "
+            "When set, it takes precedence over --data-root/--dataset."
+        ),
+    )
     parser.add_argument("--split", default="test")
     parser.add_argument(
         "--model",
@@ -61,34 +69,46 @@ def parse_args():
             "pcnn_bi_interaction",
             "pcnn_gated_fusion",
             "pcnn_gapw",
+            "pcnn_region_relation",
         ],
     )
-    parser.add_argument("--num-class", type=int, default=7)
+    parser.add_argument(
+        "--num-class",
+        type=int,
+        default=None,
+        help="Defaults to 8 for FERPlus datasets and 7 otherwise.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--print-freq", type=int, default=10)
     parser.add_argument("--backbone-path", default="models/resnet18_msceleb.pth")
-    parser.add_argument("--model-path", default="experiment/rafdb/rafdb.pth")
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help="Defaults to the matching RAF-DB or FERPlus author checkpoint.",
+    )
     parser.add_argument(
         "--head-fusion-weight",
         type=float,
         default=0.0,
         help="Use out + weight * heads as the main prediction.",
     )
-    parser.add_argument(
-        "--tta-hflip",
-        action="store_true",
-        help="Average predictions from the original and horizontally flipped image.",
-    )
-    parser.add_argument(
-        "--tta-hflip-weight",
-        type=float,
-        default=0.5,
-        help="Weight assigned to horizontally flipped predictions when --tta-hflip is enabled.",
-    )
     parser.add_argument("--gapw-patch-grid", type=int, default=4)
     parser.add_argument("--gapw-temperature", type=float, default=1.0)
+    parser.add_argument("--gapw-overlap-ratio", type=float, default=0.0)
+    parser.add_argument("--gapw-adaptive-crop", action="store_true")
+    parser.add_argument("--gapw-max-offset", type=float, default=0.25)
+    parser.add_argument("--gapw-attention-pool", action="store_true")
+    parser.add_argument("--region-relation-heads", type=int, default=4)
+    parser.add_argument("--region-dropout", type=float, default=0.2)
+    parser.add_argument("--region-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--region-output-scale",
+        type=float,
+        default=0.8,
+        help="Maximum residual scale of the region-relation classifier.",
+    )
     parser.add_argument("--allow-random-backbone", action="store_true")
     parser.add_argument(
         "--rafdb-numeric-remap",
@@ -96,11 +116,22 @@ def parse_args():
         default=True,
         help="Remap numeric RAF-DB folders (1..7) to model label order.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    return apply_dataset_defaults(args)
 
 
-def main():
-    args = parse_args()
+def apply_dataset_defaults(args):
+    is_ferplus = "ferplus" in args.dataset.lower()
+    if args.num_class is None:
+        args.num_class = 8 if is_ferplus else 7
+    if args.model_path is None:
+        checkpoint_dataset = "ferplus" if is_ferplus else "rafdb"
+        args.model_path = f"experiment/{checkpoint_dataset}/{checkpoint_dataset}.pth"
+    return args
+
+
+def main(default_dataset="rafdb"):
+    args = parse_args(default_dataset=default_dataset)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     cudnn.benchmark = torch.cuda.is_available()
 
@@ -113,8 +144,17 @@ def main():
         use_bidirectional_interaction=args.model == "pcnn_bi_interaction",
         use_gated_fusion=args.model == "pcnn_gated_fusion",
         use_gapw=args.model == "pcnn_gapw",
+        use_region_relation=args.model == "pcnn_region_relation",
         gapw_patch_grid=args.gapw_patch_grid,
         gapw_temperature=args.gapw_temperature,
+        gapw_overlap_ratio=args.gapw_overlap_ratio,
+        gapw_adaptive_crop=args.gapw_adaptive_crop,
+        gapw_max_offset=args.gapw_max_offset,
+        gapw_attention_pool=args.gapw_attention_pool,
+        region_relation_heads=args.region_relation_heads,
+        region_dropout=args.region_dropout,
+        region_temperature=args.region_temperature,
+        region_output_scale=args.region_output_scale,
     ).to(device)
 
     if os.path.exists(args.model_path):
@@ -128,7 +168,8 @@ def main():
             "Download the author's PCNN weights and place them under experiment/rafdb/."
         )
 
-    data_path = os.path.join(args.data_root, args.dataset, args.split)
+    dataset_dir = args.data_dir or os.path.join(args.data_root, args.dataset)
+    data_path = os.path.join(dataset_dir, args.split)
     val_loader = make_loader(data_path, args.batch_size, args.workers)
     criterion_cls = nn.CrossEntropyLoss().to(device)
 
@@ -180,7 +221,7 @@ def validate(val_loader, model, criterion_cls, device, args, cm_path):
             targets = remap_targets_if_needed(
                 targets, args.dataset, val_loader.dataset.classes, args.rafdb_numeric_remap
             )
-            out, heads = forward_with_tta(model, images, args.tta_hflip, args.tta_hflip_weight)
+            out, heads = model(images)
             logits = fuse_logits(out, heads, args.head_fusion_weight)
             loss = (criterion_cls(logits, targets) + criterion_cls(heads, targets)) * 10
             acc = accuracy(logits, targets)
@@ -214,18 +255,6 @@ def fuse_logits(out, heads, weight):
     if weight == 0:
         return out
     return out + weight * heads
-
-
-def forward_with_tta(model, images, use_hflip, hflip_weight):
-    out, heads = model(images)
-    if not use_hflip:
-        return out, heads
-    flipped_out, flipped_heads = model(torch.flip(images, dims=[3]))
-    original_weight = 1.0 - hflip_weight
-    return (
-        original_weight * out + hflip_weight * flipped_out,
-        original_weight * heads + hflip_weight * flipped_heads,
-    )
 
 
 def remap_targets_if_needed(targets, dataset_name, classes, enable_remap):

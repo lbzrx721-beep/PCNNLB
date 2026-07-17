@@ -4,6 +4,35 @@
 
 本文档用于规划在 PCNN 基线模型上的逐步改进路线。目标不是一次性重写整个网络，而是在可复现、可消融、可解释的前提下，围绕 PCNN 的不足逐步加入模块，形成适合硕士大论文撰写的研究主线。
 
+## 2026-07-16 当前优先路线
+
+GAPW 严格单模块实验没有超过 88.331% baseline，因此不再把 GAPW 作为当前已验证创新点。新的优先候选是：
+
+```text
+Region Reliability Relation Fusion
+区域可靠性关系融合
+模型开关：--model pcnn_region_relation
+```
+
+它将全局人脸和五个 PCNN 局部区域建模成六个 token，用样本级区域可靠性、区域丢弃和自注意力学习遮挡时的跨区域补偿；同时对局部 logits 和最终主 logits 产生直接监督路径。
+
+当前单种子结果：
+
+```text
+RAF-DB:          88.331% -> 88.592% (+0.261)
+Occlusion-RAFDB: 84.741% -> 85.150% (+0.409)
+```
+
+进入论文主实验前必须完成：
+
+```text
+1. 三个固定种子复现实验并报告 mean ± std。
+2. FERPlus 和 Occlusion-FERPlus 跨数据集验证。
+3. 去掉可靠性、去掉区域 dropout、去掉关系注意力的结构消融。
+4. 处理并复查第 23 轮出现的 non-finite loss。
+5. 绘制五区域权重和遮挡样本案例，验证权重是否具有语义。
+```
+
 ## 总体思路
 
 PCNN 的优势在于同时考虑了全局人脸信息和局部表情区域信息，但它仍然存在三个可以优化的方向：
@@ -95,7 +124,8 @@ pcnn_local_enhanced  PCNN + 数据驱动局部增强模块
 训练时使用：
 
 ```bash
-python -u train_ferplus.py \
+python -u train.py \
+  --dataset ferplus \
   --model pcnn_local_enhanced \
   --device cuda:0 \
   --batch-size 64 \
@@ -209,7 +239,7 @@ alpha、beta 初始为 0
 1. 初始状态等价于原始 PCNN，便于加载作者或本地 baseline 权重。
 2. patch 权重可视化后可以作为论文中的可解释性分析。
 3. 4x4 patch 可以和 2x2、3x3、固定 5 区域做消融。
-4. 该模块是网络内部结构创新，不属于 TTA 或测试技巧。
+4. 该模块属于网络内部结构创新。
 ```
 
 建议训练命令：
@@ -517,32 +547,6 @@ logits = out + gate(x) * heads
 ```
 
 其中 `gate(x)` 根据输入样本自适应决定局部辅助输出的贡献，而不是固定使用 0.4。
-
-### 3.6 遮挡鲁棒性扩展
-
-进一步测试发现，遮挡场景下多视角预测与局部头融合更有效：
-
-```text
-original/hflip = 0.2/0.8
-logits = out + 1.3 * heads
-```
-
-结果：
-
-```text
-RAF-DB:           88.331% -> 89.276%
-Occlusion-RAFDB: 84.196% -> 85.967%
-```
-
-这说明遮挡鲁棒性不仅依赖单图特征增强，也依赖不同视角预测之间的互补性。后续动态门控模块可以扩展为：
-
-```text
-logits = gate_o(x) * out_original
-       + gate_f(x) * out_flip
-       + gate_l(x) * heads
-```
-
-其中 `gate_o`、`gate_f` 和 `gate_l` 根据样本遮挡程度、主分支置信度和局部分支置信度自适应分配权重。
 
 ## 推荐实施顺序
 
